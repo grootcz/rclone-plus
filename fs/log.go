@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime"
+	"strings"
 
 	"github.com/sirupsen/logrus"
 )
@@ -57,9 +59,40 @@ func (logLevelChoices) Type() string {
 // LogPrintPid enables process pid in log
 var LogPrintPid = false
 
+func Caller(level int) (file string, line int, pkgName string, funcName string) {
+	pc, file, line, ok := runtime.Caller(level)
+	if !ok {
+		return "", 0, "", ""
+	}
+
+	pcInfoStr := runtime.FuncForPC(pc).Name()
+
+	lastPathSplitIndex := strings.LastIndex(pcInfoStr, "/")
+	if lastPathSplitIndex <= 0 {
+		firstfuncSplitIndex := strings.Index(pcInfoStr, ".")
+		pkgName = pcInfoStr[:firstfuncSplitIndex]
+		funcName = pcInfoStr[firstfuncSplitIndex+1:]
+	} else {
+		pkgStr := pcInfoStr[:lastPathSplitIndex]
+		funcStr := pcInfoStr[lastPathSplitIndex+1:]
+
+		firstfuncSplitIndex := strings.Index(funcStr, ".")
+
+		pkgName = pkgStr + "/" + funcStr[:firstfuncSplitIndex]
+		funcName = funcStr[firstfuncSplitIndex+1:]
+	}
+
+	if !strings.Contains(funcName, "()") {
+		funcName = funcName + "()"
+	}
+
+	return file, line, pkgName, funcName
+}
+
 // LogPrint sends the text to the logger of level
 var LogPrint = func(level LogLevel, text string) {
-	text = fmt.Sprintf("%-6s: %s", level, text)
+	file, line, _, _ := Caller(4)
+	text = fmt.Sprintf("%s:%d %-6s: %s", file, line, level, text)
 	if LogPrintPid {
 		text = fmt.Sprintf("[%d] %s", os.Getpid(), text)
 	}

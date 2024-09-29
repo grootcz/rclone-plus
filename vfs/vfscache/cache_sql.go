@@ -1,5 +1,3 @@
-//go:build rclone_original
-
 // Package vfscache deals with caching of files locally for the VFS layer
 package vfscache
 
@@ -15,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/rclone/rclone/fs/dbmeta"
 
 	"github.com/rclone/rclone/fs"
 	fscache "github.com/rclone/rclone/fs/cache"
@@ -108,6 +108,12 @@ func New(ctx context.Context, fremote fs.Fs, opt *vfscommon.Options, avFn AddVir
 	fs.Debugf(nil, "vfs cache: data root is %q", dataOSPath)
 	fs.Debugf(nil, "vfs cache: metadata root is %q", metaOSPath)
 
+	err = dbmeta.GetOriginCache().Init(parentOSPath)
+	if err != nil {
+		fs.Errorf(nil, "%s", err)
+		return nil, err
+	}
+
 	// Get (create) cache backends
 	var fdata, fmeta fs.Fs
 	if fdata, fmeta, err = getBackends(ctx, parentPath, relativeDirPath); err != nil {
@@ -132,7 +138,7 @@ func New(ctx context.Context, fremote fs.Fs, opt *vfscommon.Options, avFn AddVir
 	}
 
 	// load in the cache and metadata off disk
-	err = c.reload(ctx)
+	err = c.sqlCacheReload(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load cache: %w", err)
 	}
@@ -204,11 +210,30 @@ func (c *Cache) createItemDir(name string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to create data cache item directory: %w", err)
 	}
-	parentPathMeta := c.toOSPathMeta(parent)
-	err = createDir(parentPathMeta)
+
+	//parentPathMeta := c.toOSPathMeta(parent)
+	//err = createDir(parentPathMeta)
+	//if err != nil {
+	//	return "", fmt.Errorf("failed to create metadata cache item directory: %w", err)
+	//}
+
+	parentDir, itemName := filepath.Split(name)
+	sqlItemMeta := dbmeta.Item{
+		ParentPath: parentDir,
+		Name:       itemName,
+		Type:       fs.EntryDirectory,
+		Size:       0,
+		State:      0,
+		Sha1:       "",
+		CreatedAt:  time.Now().Unix(),
+		UpdatedAt:  0,
+		Info:       nil,
+	}
+	err = dbmeta.GetOriginCache().UpsertItem(context.Background(), sqlItemMeta)
 	if err != nil {
 		return "", fmt.Errorf("failed to create metadata cache item directory: %w", err)
 	}
+
 	return c.toOSPath(name), nil
 }
 
@@ -492,6 +517,7 @@ func (c *Cache) CleanUp() error {
 	if err1 != nil {
 		return err1
 	}
+	dbmeta.GetOriginCache().DeleteAllItem(context.Background())
 	return err2
 }
 
@@ -540,6 +566,35 @@ func (c *Cache) reload(ctx context.Context) error {
 			return fmt.Errorf("failed to walk cache %q: %w", dir, err)
 		}
 	}
+	return nil
+}
+
+// sqlCacheReload walks the cache loading metadata files
+//
+// It iterates the files first then metadata trees. It doesn't expect
+// to find any new items iterating the metadata but it will clear up
+// orphan files.
+func (c *Cache) sqlCacheReload(ctx context.Context) error {
+	allItem, err := dbmeta.GetOriginCache().GetAllItem(ctx)
+	if err != nil {
+		return err
+	}
+
+	for _, item := range allItem {
+		if item.Type == fs.EntryDirectory {
+			continue
+		}
+
+		itemPath := filepath.Join(item.ParentPath, item.Name)
+		item, found := c.get(itemPath)
+		if !found {
+			err := item.reload(ctx)
+			if err != nil {
+				fs.Errorf(itemPath, "vfs cache: failed to reload item: %v", err)
+			}
+		}
+	}
+
 	return nil
 }
 

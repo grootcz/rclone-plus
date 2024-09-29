@@ -98,6 +98,7 @@ func (c *copy) checkPartial() (remoteForCopy string, inplace bool, err error) {
 	// Avoid making the leaf name longer if it's already lengthy to avoid
 	// trouble with file name length limits.
 	suffix := "." + random.String(8) + c.ci.PartialSuffix
+	fs.Logf(nil, "[zjm-debug] Partial!!!")
 	base := path.Base(remoteForCopy)
 	if len(base) > 100 {
 		remoteForCopy = TruncateString(remoteForCopy, len(remoteForCopy)-len(suffix)) + suffix

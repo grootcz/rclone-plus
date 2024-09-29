@@ -342,6 +342,8 @@ var (
 	errLinksNeedsSuffix  = errors.New("need \"" + linkSuffix + "\" suffix to refer to symlink when using -l/--links")
 )
 
+const logModuleKey = "myLocal"
+
 // NewFs constructs an Fs from the path
 func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	// Parse config into Options struct
@@ -692,6 +694,10 @@ func (f *Fs) localPath(name string) string {
 // Put the Object to the local filesystem
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	// Temporary Object under construction - info filled in by Update()
+	if f.name == logModuleKey {
+		fs.Logf(nil, "[remote] Put %s", src.Remote())
+	}
+
 	o := f.newObject(src.Remote())
 	err := o.Update(ctx, in, src, options...)
 	if err != nil {
@@ -707,6 +713,10 @@ func (f *Fs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, opt
 
 // Mkdir creates the directory if it doesn't exist
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
+	if f.name == logModuleKey {
+		fs.Logf(nil, "[remote] Mkdir %s", dir)
+	}
+
 	localPath := f.localPath(dir)
 	err := file.MkdirAll(localPath, 0777)
 	if err != nil {
@@ -778,6 +788,10 @@ func (f *Fs) MkdirMetadata(ctx context.Context, dir string, metadata fs.Metadata
 //
 // If it isn't empty it will return an error
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
+	if f.name == logModuleKey {
+		fs.Logf(nil, "[remote] Rmdir %s", dir)
+	}
+
 	localPath := f.localPath(dir)
 	if fi, err := os.Stat(localPath); err != nil {
 		return err
@@ -861,6 +875,10 @@ func (f *Fs) readPrecision() (precision time.Duration) {
 //
 // If it isn't possible then return fs.ErrorCantMove
 func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	if f.name == logModuleKey {
+		fs.Logf(nil, "[remote] Move %s => %s", src.Remote(), remote)
+	}
+
 	srcObj, ok := src.(*Object)
 	if !ok {
 		fs.Debugf(src, "Can't move - not same remote type")
@@ -942,6 +960,10 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	}
 	srcPath := srcFs.localPath(srcRemote)
 	dstPath := f.localPath(dstRemote)
+
+	if f.name == logModuleKey {
+		fs.Logf(nil, "[remote] DirMove %s => %s", srcPath, dstPath)
+	}
 
 	// Check if destination exists
 	_, err := os.Lstat(dstPath)
@@ -1312,6 +1334,9 @@ func (nwc nopWriterCloser) Close() error {
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
 	var out io.WriteCloser
 	var hasher *hash.MultiHasher
+	if o.fs.name == logModuleKey {
+		fs.Logf(nil, "[remote] Update %s", src.Remote())
+	}
 
 	for _, option := range options {
 		switch x := option.(type) {
@@ -1523,6 +1548,10 @@ func (o *Object) lstat() error {
 
 // Remove an object
 func (o *Object) Remove(ctx context.Context) error {
+	if o.fs.name == logModuleKey {
+		fs.Logf(nil, "[remote] Remove %s", o.path)
+	}
+
 	o.clearHashCache()
 	return remove(o.path)
 }
