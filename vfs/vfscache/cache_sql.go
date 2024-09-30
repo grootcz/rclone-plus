@@ -217,7 +217,7 @@ func (c *Cache) createItemDir(name string) (string, error) {
 	//	return "", fmt.Errorf("failed to create metadata cache item directory: %w", err)
 	//}
 
-	parentDir, itemName := filepath.Split(name)
+	parentDir, itemName := filepath.Split(parent)
 	sqlItemMeta := dbmeta.Item{
 		ParentPath: parentDir,
 		Name:       itemName,
@@ -482,6 +482,12 @@ func (c *Cache) DirRename(oldDirName string, newDirName string) (err error) {
 	// Old path should be empty now so remove it
 	c.purgeEmptyDirs(oldDirName[:len(oldDirName)-1], false)
 
+	err = dbmeta.GetOriginCache().RenameItem(context.Background(),
+		strings.TrimSuffix(oldDirName, "/"), strings.TrimSuffix(newDirName, "/"))
+	if err != nil {
+		fs.Errorf(nil, "dir rename %s => %s failed: %s", oldDirName, newDirName, err)
+	}
+
 	fs.Infof(oldDirName, "vfs cache: renamed dir in cache to %q", newDirName)
 	return err
 }
@@ -733,10 +739,10 @@ func (c *Cache) purgeEmptyDirs(dir string, leaveRoot bool) {
 	if err != nil {
 		fs.Errorf(c.fcache, "vfs cache: failed to remove empty directories from cache path %q: %v", dir, err)
 	}
-	err = operations.Rmdirs(ctx, c.fcacheMeta, dir, leaveRoot)
-	if err != nil {
-		fs.Errorf(c.fcache, "vfs cache: failed to remove empty directories from metadata cache path %q: %v", dir, err)
-	}
+	//err = operations.Rmdirs(ctx, c.fcacheMeta, dir, leaveRoot)
+	//if err != nil {
+	//	fs.Errorf(c.fcache, "vfs cache: failed to remove empty directories from metadata cache path %q: %v", dir, err)
+	//}
 }
 
 // updateUsed updates c.used so it is accurate

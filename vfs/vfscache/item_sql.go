@@ -241,6 +241,10 @@ func (item *Item) _save() (err error) {
 	//	return fmt.Errorf("vfs cache item: failed to encode metadata: %w", err)
 	//}
 
+	if !item._exists() {
+		return
+	}
+
 	var json = jsoniter.ConfigCompatibleWithStandardLibrary
 	infoByte, err := json.Marshal(item.info)
 	if err != nil {

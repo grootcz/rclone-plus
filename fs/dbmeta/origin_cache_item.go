@@ -183,6 +183,38 @@ func (oc *OriginCache) RenameItem(ctx context.Context, oldName string, newName s
 		//"updated_at":  time.Now().Unix(),
 	})
 	if result.Error != nil {
+		if strings.Contains(result.Error.Error(), ErrorOfUniqueKeyExist) {
+			err := oc.db.Transaction(func(tx *gorm.DB) error {
+				var sqlMeta Item
+				rd := tx.Table(TableNameOfOriginCacheItem).
+					Where("parent_path=? and name=?", newParentDir, newItemName).
+					Delete(&sqlMeta)
+				if rd.Error != nil {
+					fs.Errorf(nil, "error = %s", result.Error)
+					return rd.Error
+				}
+
+				ru := tx.Table(TableNameOfOriginCacheItem).
+					Where("parent_path=? and name=?", oldParentDir, oldItemName).
+					Updates(map[string]interface{}{
+						"parent_path": newParentDir,
+						"name":        newItemName,
+						//"updated_at":  time.Now().Unix(),
+					})
+				if ru.Error != nil {
+					fs.Errorf(nil, "error = %s", result.Error)
+					return rd.Error
+				}
+
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+
+			return nil
+		}
+
 		fs.Errorf(nil, "update item %s => %s error = %s", oldName, newName, result.Error)
 		return result.Error
 	}
@@ -204,7 +236,7 @@ func (oc *OriginCache) GetItem(ctx context.Context, name string) (Item, error) {
 		Where("parent_path=? and name=?", parentDir, itemName).
 		WithContext(ctxTemp).First(&item)
 	if result.Error != nil {
-		fs.Errorf(nil, "get item=%s error = %s", name, result.Error)
+		//fs.Errorf(nil, "get item=%s error = %s", name, result.Error)
 		return item, result.Error
 	}
 
