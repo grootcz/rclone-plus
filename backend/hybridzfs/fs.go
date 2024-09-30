@@ -2,8 +2,22 @@ package hybridzfs
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/pkg/xattr"
+
+	"github.com/rclone/rclone/fs/config/configstruct"
+
+	"github.com/rclone/rclone/fs/hash"
 
 	"github.com/rclone/rclone/backend/local"
 	"github.com/rclone/rclone/fs"
@@ -313,19 +327,413 @@ only useful for reading.
 	fs.Register(fsi)
 }
 
+// Options defines the configuration for this backend
+type Options struct {
+	FollowSymlinks    bool                 `config:"copy_links"`
+	TranslateSymlinks bool                 `config:"links"`
+	SkipSymlinks      bool                 `config:"skip_links"`
+	UTFNorm           bool                 `config:"unicode_normalization"`
+	NoCheckUpdated    bool                 `config:"no_check_updated"`
+	NoUNC             bool                 `config:"nounc"`
+	OneFileSystem     bool                 `config:"one_file_system"`
+	CaseSensitive     bool                 `config:"case_sensitive"`
+	CaseInsensitive   bool                 `config:"case_insensitive"`
+	NoPreAllocate     bool                 `config:"no_preallocate"`
+	NoSparse          bool                 `config:"no_sparse"`
+	NoSetModTime      bool                 `config:"no_set_modtime"`
+	TimeType          timeType             `config:"time_type"`
+	Enc               encoder.MultiEncoder `config:"encoding"`
+	NoClone           bool                 `config:"no_clone"`
+}
+
 type Hvfs struct {
+	name           string              // the name of the remote
+	root           string              // The root directory (OS path)
+	opt            Options             // parsed config options
+	features       *fs.Features        // optional features
+	dev            uint64              // device number of root node
+	precisionOk    sync.Once           // Whether we need to read the precision
+	precision      time.Duration       // precision of local filesystem
+	warnedMu       sync.Mutex          // used for locking access to 'warned'.
+	warned         map[string]struct{} // whether we have warned about this string
+	xattrSupported atomic.Int32        // whether xattrs are supported
+
+	// do os.Lstat or os.Stat
+	lstat        func(name string) (os.FileInfo, error)
+	objectMetaMu sync.RWMutex // global lock for Object metadata
+
 	localFs  fs.Fs // is same as cache vfs fs
 	sqlFs    fs.Fs
 	remoteFs fs.Fs
 }
 
+var (
+	errLinksAndCopyLinks = errors.New("can't use -l/--links with -L/--copy-links")
+	errLinksNeedsSuffix  = errors.New("need \"" + linkSuffix + "\" suffix to refer to symlink when using -l/--links")
+)
+
+const xattrSupported = xattr.XATTR_SUPPORTED
+
 func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
-	f, err := local.NewFs(ctx, name, root, m)
+	opt := new(Options)
+	err := configstruct.Set(m, opt)
 	if err != nil {
 		return nil, err
+	}
+	if opt.TranslateSymlinks && opt.FollowSymlinks {
+		return nil, errLinksAndCopyLinks
+	}
+
+	localFs, err := local.NewFs(ctx, name, root, m)
+	if err != nil {
+		return nil, err
+	}
+
+	f := &Hvfs{
+		name:   name,
+		opt:    *opt,
+		warned: make(map[string]struct{}),
+		dev:    devUnset,
+		lstat:  os.Lstat,
+
+		localFs: localFs,
+	}
+	if xattrSupported {
+		f.xattrSupported.Store(1)
+	}
+	f.root = local.CleanRootPath(root, f.opt.NoUNC, f.opt.Enc)
+	f.features = (&fs.Features{
+		CaseInsensitive:          f.caseInsensitive(),
+		CanHaveEmptyDirectories:  true,
+		IsLocal:                  true,
+		SlowHash:                 true,
+		ReadMetadata:             true,
+		WriteMetadata:            true,
+		ReadDirMetadata:          true,
+		WriteDirMetadata:         true,
+		WriteDirSetModTime:       true,
+		UserDirMetadata:          xattrSupported, // can only R/W general purpose metadata if xattrs are supported
+		DirModTimeUpdatesOnWrite: true,
+		UserMetadata:             xattrSupported, // can only R/W general purpose metadata if xattrs are supported
+		FilterAware:              true,
+		PartialUploads:           true,
+		About:                    f.About,
+	}).Fill(ctx, f)
+	if opt.FollowSymlinks {
+		f.lstat = os.Stat
+	}
+	if opt.FollowSymlinks {
+		f.lstat = os.Stat
+	}
+	if opt.NoClone {
+		// Disable server-side copy when --local-no-clone is set
+		f.features.Copy = nil
+	}
+
+	// Check to see if this points to a file
+	fi, err := f.lstat(f.root)
+	if err == nil {
+		f.dev = readDevice(fi, f.opt.OneFileSystem)
+	}
+
+	// Check to see if this is a .rclonelink if not found
+	hasLinkSuffix := strings.HasSuffix(f.root, linkSuffix)
+	if hasLinkSuffix && opt.TranslateSymlinks && os.IsNotExist(err) {
+		fi, err = f.lstat(strings.TrimSuffix(f.root, linkSuffix))
+	}
+	if err == nil && f.isRegular(fi.Mode()) {
+		// Handle the odd case, that a symlink was specified by name without the link suffix
+		if !hasLinkSuffix && opt.TranslateSymlinks && fi.Mode()&os.ModeSymlink != 0 {
+			return nil, errLinksNeedsSuffix
+		}
+		// It is a file, so use the parent as the root
+		f.root = filepath.Dir(f.root)
+		// return an error with an fs which points to the parent
+		return f, fs.ErrorIsFile
 	}
 
 	fs.Logf(nil, "name=%s, root=%s", name, root)
 
 	return f, nil
 }
+
+func (f *Hvfs) caseInsensitive() bool {
+	if f.opt.CaseSensitive {
+		return false
+	}
+	if f.opt.CaseInsensitive {
+		return true
+	}
+	// FIXME not entirely accurate since you can have case
+	// sensitive Fses on darwin and case insensitive Fses on linux.
+	// Should probably check but that would involve creating a
+	// file in the remote to be most accurate which probably isn't
+	// desirable.
+	return runtime.GOOS == "windows" || runtime.GOOS == "darwin"
+}
+
+func (f *Hvfs) isRegular(mode os.FileMode) bool {
+	if !f.opt.TranslateSymlinks {
+		return mode.IsRegular()
+	}
+
+	// fi.Mode().IsRegular() tests that all mode bits are zero
+	// Since symlinks are accepted, test that all other bits are zero,
+	// except the symlink bit
+	return mode&os.ModeType&^os.ModeSymlink == 0
+}
+
+const devUnset = 0xdeadbeefcafebabf
+
+func readDevice(fi os.FileInfo, oneFileSystem bool) uint64 {
+	return devUnset
+}
+
+/************************************************** Hvfs ***************************************************/
+
+// Name of the remote (as passed into NewFs)
+func (f *Hvfs) Name() string {
+	return f.name
+}
+
+// Root of the remote (as passed into NewFs)
+func (f *Hvfs) Root() string {
+	return f.opt.Enc.ToStandardPath(filepath.ToSlash(f.root))
+}
+
+// String converts this Fs to a string
+func (f *Hvfs) String() string {
+	return fmt.Sprintf("Local file system at %s", f.Root())
+}
+
+func (f *Hvfs) Precision() (precision time.Duration) {
+	return f.localFs.Precision()
+}
+
+// Hashes returns the supported hash sets.
+func (f *Hvfs) Hashes() hash.Set {
+	return f.localFs.Hashes()
+}
+
+// Features returns the optional features of this Fs
+func (f *Hvfs) Features() *fs.Features {
+	return f.features
+}
+
+func (f *Hvfs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
+	return f.localFs.List(ctx, dir)
+}
+
+func (f *Hvfs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+
+	return f.localFs.NewObject(ctx, remote)
+}
+
+func (f *Hvfs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	fs.Logf(nil, "[remote] Put %s", src.Remote())
+	return f.localFs.Put(ctx, in, src, options...)
+}
+
+func (f *Hvfs) Mkdir(ctx context.Context, dir string) error {
+	fs.Logf(nil, "[remote] Mkdir %s", dir)
+	return f.localFs.Mkdir(ctx, dir)
+}
+
+func (f *Hvfs) Rmdir(ctx context.Context, dir string) error {
+	fs.Logf(nil, "[remote] Rmdir %s", dir)
+	return f.localFs.Rmdir(ctx, dir)
+}
+
+/*********************************************** fs.PutStreamer ******************************************************/
+
+func (f *Hvfs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	putStreamer, ok := f.localFs.(fs.PutStreamer)
+	if !ok {
+		return nil, fmt.Errorf("not support fs PutStream")
+	}
+	fs.Logf(nil, "[remote] PutStream %s", src.Remote())
+	return putStreamer.PutStream(ctx, in, src, options...)
+}
+
+/********************************************** fs.Mover *******************************************************/
+
+func (f *Hvfs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	mover, ok := f.localFs.(fs.Mover)
+	if !ok {
+		return nil, fmt.Errorf("not support fs Move")
+	}
+	fs.Logf(nil, "[remote] Move %s => %s", src.Remote(), remote)
+	return mover.Move(ctx, src, remote)
+}
+
+/********************************************** fs.DirMover *******************************************************/
+
+func (f *Hvfs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
+	dirMover, ok := f.localFs.(fs.DirMover)
+	if !ok {
+		return fmt.Errorf("not support fs DirMove")
+	}
+	fs.Logf(nil, "[remote] DirMove %s => %s", src.Name(), dstRemote)
+	return dirMover.DirMove(ctx, src, srcRemote, dstRemote)
+}
+
+/********************************************** fs.OpenWriterAter *******************************************************/
+
+func (f *Hvfs) OpenWriterAt(ctx context.Context, remote string, size int64) (fs.WriterAtCloser, error) {
+	openWriterAter, ok := f.localFs.(fs.OpenWriterAter)
+	if !ok {
+		return nil, fmt.Errorf("not support fs OpenWriterAt")
+	}
+
+	return openWriterAter.OpenWriterAt(ctx, remote, size)
+}
+
+/*********************************************** fs.DirSetModTimer ******************************************************/
+
+func (f *Hvfs) DirSetModTime(ctx context.Context, dir string, modTime time.Time) error {
+	dirSetModTimer, ok := f.localFs.(fs.DirSetModTimer)
+	if !ok {
+		return fmt.Errorf("not support fs DirSetModTime")
+	}
+
+	return dirSetModTimer.DirSetModTime(ctx, dir, modTime)
+}
+
+/********************************************** fs.MkdirMetadataer *******************************************************/
+
+func (f *Hvfs) MkdirMetadata(ctx context.Context, dir string, metadata fs.Metadata) (fs.Directory, error) {
+	mdkirMetaDataer, ok := f.localFs.(fs.MkdirMetadataer)
+	if !ok {
+		return nil, fmt.Errorf("not support fs MkdirMetadata")
+	}
+
+	return mdkirMetaDataer.MkdirMetadata(ctx, dir, metadata)
+}
+
+/*********************************************** fs.Commander ******************************************************/
+
+func (f *Hvfs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (interface{}, error) {
+	commander, ok := f.localFs.(fs.Commander)
+	if !ok {
+		return nil, fmt.Errorf("not support fs Command")
+	}
+
+	return commander.Command(ctx, name, arg, opt)
+}
+
+/*********************************************** fs.About ******************************************************/
+
+func (f *Hvfs) About(ctx context.Context) (*fs.Usage, error) {
+	var usage fs.Usage
+	fs.Logf(nil, "[remote] get usage")
+	return &usage, nil
+}
+
+/************************************************** Object ***************************************************/
+
+// Object represents a local filesystem object
+type Object struct {
+	fs          *Hvfs // The Fs this object is part of
+	localObject *local.Object
+}
+
+// Fs returns the parent Fs
+func (o *Object) Fs() fs.Info {
+	return o.fs
+}
+
+// Return a string version
+func (o *Object) String() string {
+	if o == nil {
+		return "<nil>"
+	}
+	return o.localObject.String()
+}
+
+// Remote returns the remote path
+func (o *Object) Remote() string {
+	return o.localObject.Remote()
+}
+
+// ModTime returns the modification time of the object
+func (o *Object) ModTime(ctx context.Context) time.Time {
+	return o.localObject.ModTime(ctx)
+}
+
+// Size returns the size of an object in bytes
+func (o *Object) Size() int64 {
+	return o.localObject.Size()
+}
+
+func (o *Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
+	return o.localObject.Hash(ctx, ty)
+}
+
+func (o *Object) Storable() bool {
+	return o.localObject.Storable()
+}
+
+func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
+	return o.localObject.SetModTime(ctx, t)
+}
+
+func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	fs.Logf(nil, "[remote] Open %s", o.Remote())
+	return o.localObject.Open(ctx, options...)
+}
+
+func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	fs.Logf(nil, "[remote] Update %s", src.Remote())
+	return o.localObject.Update(ctx, in, src, options...)
+}
+
+func (o *Object) Remove(ctx context.Context) error {
+	fs.Logf(nil, "[remote] Remove %s", o.Remote())
+	return o.localObject.Remove(ctx)
+}
+
+/*****************************************************************************************************/
+
+func (o *Object) Metadata(ctx context.Context) (metadata fs.Metadata, err error) {
+	return o.localObject.Metadata(ctx)
+}
+
+/*****************************************************************************************************/
+
+func (o *Object) SetMetadata(ctx context.Context, metadata fs.Metadata) error {
+	return o.localObject.SetMetadata(ctx, metadata)
+}
+
+/************************************************* Directory ****************************************************/
+
+// Directory represents a local filesystem directory
+type Directory struct {
+	Object
+}
+
+func (d *Directory) Items() int64 {
+	return -1
+}
+
+func (d *Directory) ID() string {
+	return ""
+}
+
+/*************************************************** check **************************************************/
+
+var (
+	_ fs.Fs              = &Hvfs{}
+	_ fs.PutStreamer     = &Hvfs{}
+	_ fs.Mover           = &Hvfs{}
+	_ fs.DirMover        = &Hvfs{}
+	_ fs.Commander       = &Hvfs{}
+	_ fs.OpenWriterAter  = &Hvfs{}
+	_ fs.DirSetModTimer  = &Hvfs{}
+	_ fs.MkdirMetadataer = &Hvfs{}
+	_ fs.Object          = &Object{}
+	_ fs.Metadataer      = &Object{}
+	_ fs.SetMetadataer   = &Object{}
+	_ fs.Directory       = &Directory{}
+	_ fs.SetModTimer     = &Directory{}
+	_ fs.SetMetadataer   = &Directory{}
+)

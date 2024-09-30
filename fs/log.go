@@ -94,12 +94,12 @@ func Caller(level int) (file string, line int, pkgName string, funcName string) 
 
 // LogOutput sends the text to the logger of level
 var LogOutput = func(level LogLevel, text string) {
-	file, line, _, _ := Caller(4)
-	text = fmt.Sprintf("%s:%d %-6s: %s", file, line, level, text)
+	//file, line, _, _ := Caller(7)
+	text = fmt.Sprintf("%-6s: %s", level, text)
 	if LogPrintPid {
 		text = fmt.Sprintf("[%d] %s", os.Getpid(), text)
 	}
-	_ = log.Output(4, text)
+	_ = log.Output(7, text)
 }
 
 // LogValueItem describes keyed item for a JSON log entry
